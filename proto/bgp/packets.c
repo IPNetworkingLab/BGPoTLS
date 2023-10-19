@@ -110,15 +110,17 @@ init_mrt_bgp_data(struct bgp_conn *conn, struct mrt_bgp_data *d)
 static uint bgp_find_update_afi(byte *pos, uint len);
 
 static int
-bgp_estimate_add_path(struct bgp_proto *p, byte *pkt, uint len)
+bgp_estimate_add_path(struct bgp_proto *p, byte *pkt, uint len, int rx)
 {
   /* No need to estimate it for other messages than UPDATE */
   if (pkt[18] != PKT_UPDATE)
     return 0;
 
   /* 1 -> no channel, 2 -> all channels, 3 -> some channels */
-  if (p->summary_add_path_rx < 3)
+  if (rx && p->summary_add_path_rx < 3)
     return p->summary_add_path_rx == 2;
+  if (!rx && p->summary_add_path_tx < 3)
+    return p->summary_add_path_tx == 2;
 
   uint afi = bgp_find_update_afi(pkt, len);
   struct bgp_channel *c = bgp_get_channel(p, afi);
@@ -130,20 +132,20 @@ bgp_estimate_add_path(struct bgp_proto *p, byte *pkt, uint len)
     return 0;
   }
 
-  return c->add_path_rx;
+  return rx ? c->add_path_rx : c->add_path_tx;
 }
 
 static void
-bgp_dump_message(struct bgp_conn *conn, byte *pkt, uint len)
+bgp_dump_message(struct bgp_conn *conn, byte *pkt, uint len, int extended_ts, int is_local)
 {
   struct mrt_bgp_data d;
   init_mrt_bgp_data(conn, &d);
 
   d.message = pkt;
   d.msg_len = len;
-  d.add_path = bgp_estimate_add_path(conn->bgp, pkt, len);
+  d.add_path = bgp_estimate_add_path(conn->bgp, pkt, len, !is_local);
 
-  mrt_dump_bgp_message(&d);
+  mrt_dump_bgp_message(&d, extended_ts, is_local);
 }
 
 void
@@ -155,7 +157,7 @@ bgp_dump_state_change(struct bgp_conn *conn, uint old, uint new)
   d.old_state = old;
   d.new_state = new;
 
-  mrt_dump_bgp_state_change(&d);
+  mrt_dump_bgp_state_change(&d, conn->bgp->p.mrtdump_et);
 }
 
 static byte *
@@ -3007,6 +3009,9 @@ bgp_send(struct bgp_conn *conn, uint type, uint len)
   put_u16(buf+16, len);
   buf[18] = type;
 
+  if (conn->bgp->p.mrtdump & MD_MESSAGES)
+    bgp_dump_message(conn, buf, len, conn->bgp->p.mrtdump_et == 1 ? 1 : 0, 1);
+
   return sk_send(sk, len);
 }
 
@@ -3396,7 +3401,7 @@ bgp_rx_packet(struct bgp_conn *conn, byte *pkt, uint len)
   conn->bgp->stats.rx_bytes += len;
 
   if (conn->bgp->p.mrtdump & MD_MESSAGES)
-    bgp_dump_message(conn, pkt, len);
+    bgp_dump_message(conn, pkt, len, conn->bgp->p.mrtdump_et == 1 ? 1 : 0, 0);
 
   switch (type)
   {

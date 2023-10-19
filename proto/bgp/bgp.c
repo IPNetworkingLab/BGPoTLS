@@ -126,6 +126,7 @@
 
 #include "bgp.h"
 #include "proto/bmp/bmp.h"
+#include "lib/evt_notifier.h"
 
 
 static list STATIC_LIST_INIT(bgp_sockets);		/* Global list of listening sockets */
@@ -176,7 +177,7 @@ bgp_open(struct bgp_proto *p)
     }
 
   sock *sk = sk_new(proto_pool);
-  sk->type = SK_TCP_PASSIVE;
+  sk->type = BGP_CONN_TCP == p->cf->conn_type ? SK_TCP_PASSIVE : SK_TLS_PASSIVE;
   sk->ttl = 255;
   sk->saddr = addr;
   sk->sport = port;
@@ -188,6 +189,37 @@ bgp_open(struct bgp_proto *p)
   sk->tbsize = BGP_TX_BUFFER_SIZE;
   sk->rx_hook = bgp_incoming_connection;
   sk->err_hook = bgp_listen_sock_err;
+  sk->tcp_auth_mode = p->cf->tcp_auth_mode;
+
+  /* todo check if another alternative exists */
+  if (p->cf->tcp_auth_mode == AUTH_TCP_AO ||
+      p->cf->tcp_auth_mode == AUTH_TCP_AO_TLS) {
+    sk->sndid = 10;
+    sk->rcvid = 23;
+  }
+
+  if (SK_TLS_PASSIVE == sk->type) {
+      if (sk_set_tls(sk, p->cf->tls_certs, p->cf->tls_pkey,
+                     p->cf->tls_alpn, strnlen(p->cf->tls_alpn, 15),
+                     p->cf->tls_peer_sni, strnlen(p->cf->tls_peer_sni, 80),
+                     p->cf->tls_root_ca, p->cf->tls_export_key_file,
+                     p->cf->tls_local_sni, strnlen(p->cf->tls_local_sni, 80)) == -1)
+          goto err;
+
+      /* this is local client cert */
+      if (p->p.cf->control_socket) {
+          char msg[8195];
+          size_t cert_len = sizeof(msg) - 3;
+
+          if (sk_local_cert_to_pem(sk, msg+3, &cert_len) != 0) {
+              log(L_ERR "PEM CERT TOO LARGE");
+          } else  {
+              msg[0] = EVT_NOTIF_LOCAL_CERT;
+              put_u16(msg+1, cert_len);
+              evt_notifier_schedule_packet(p->p.cf->control_socket, msg, cert_len + 3);
+          }
+      }
+  }
 
   if (sk_open(sk) < 0)
     goto err;
@@ -233,6 +265,7 @@ bgp_close(struct bgp_proto *p)
 static inline int
 bgp_setup_auth(struct bgp_proto *p, int enable)
 {
+  int rv;
   if (p->cf->password)
   {
     ip_addr prefix = p->cf->remote_ip;
@@ -244,9 +277,32 @@ bgp_setup_auth(struct bgp_proto *p, int enable)
       pxlen = net_pxlen(p->cf->remote_range);
     }
 
-    int rv = sk_set_md5_auth(p->sock->sk,
-			     p->cf->local_ip, prefix, pxlen, p->cf->iface,
-			     enable ? p->cf->password : NULL, p->cf->setkey);
+    switch (p->cf->tcp_auth_mode) {
+      case AUTH_TCP_MD5:
+        rv = sk_set_md5_auth(p->sock->sk,
+                             p->cf->local_ip, prefix, pxlen, p->cf->iface,
+                             enable ? p->cf->password : NULL, p->cf->setkey);
+        break;
+        case AUTH_TCP_AO_TLS:
+            if (!IS_SK_TLS(p->sock->sk->type)) {
+                die("TCP-AO-TLS requested but this is not a BGP-TLS session");
+            }
+            /* fallthrough */
+        case AUTH_TCP_AO:
+            rv = sk_set_tcp_ao_auth(p->sock->sk,
+                                    p->cf->local_ip, prefix, pxlen, p->cf->iface,
+                                    p->cf->password, p->cf->password_len,
+                                    p->sock->sk->sndid, p->sock->sk->rcvid, enable);
+            if (enable)
+                log(L_INFO "%s: TCP-AO enabled (%d): %s (sndid %d rcvid %d)", p->p.name, p->sock->sk->type,
+                p->cf->tcp_auth_mode == AUTH_TCP_AO ? "with provided password" : "draft-piraux-tcp-ao-tls mode",
+                    p->sock->sk->sndid, p->sock->sk->rcvid);
+        break;
+      default:
+        log(L_ERR "%s: TCP authentication mode no supported", p->p.name);
+        rv = -1;
+        break;
+    }
 
     if (rv < 0)
       sk_log_error(p->sock->sk, p->p.name);
@@ -598,6 +654,7 @@ bgp_conn_enter_established_state(struct bgp_conn *conn)
 
   /* Summary state of ADD_PATH RX for active channels */
   uint summary_add_path_rx = 0;
+  uint summary_add_path_tx = 0;
 
   BGP_WALK_CHANNELS(p, c)
   {
@@ -664,8 +721,10 @@ bgp_conn_enter_established_state(struct bgp_conn *conn)
     c->add_path_rx = (loc->add_path & BGP_ADD_PATH_RX) && (rem->add_path & BGP_ADD_PATH_TX);
     c->add_path_tx = (loc->add_path & BGP_ADD_PATH_TX) && (rem->add_path & BGP_ADD_PATH_RX);
 
-    if (active)
-      summary_add_path_rx |= !c->add_path_rx ? 1 : 2;
+    if (active) {
+        summary_add_path_rx |= !c->add_path_rx ? 1 : 2;
+        summary_add_path_tx |= !c->add_path_tx ? 1 : 2;
+    }
 
     /* Update RA mode */
     if (c->add_path_tx)
@@ -680,6 +739,7 @@ bgp_conn_enter_established_state(struct bgp_conn *conn)
   p->channel_map = mb_alloc(p->p.pool, num * sizeof(void *));
   p->channel_count = num;
   p->summary_add_path_rx = summary_add_path_rx;
+  p->summary_add_path_tx = summary_add_path_tx;
 
   BGP_WALK_CHANNELS(p, c)
   {
@@ -968,6 +1028,27 @@ bgp_connected(sock *sk)
 {
   struct bgp_conn *conn = sk->data;
   struct bgp_proto *p = conn->bgp;
+  char *cert;
+  size_t len;
+
+  /* if opportunistic TCP-AO change key here */
+  if (sk->tcp_auth_mode == AUTH_TCP_AO_TLS) {
+      if (sk_tls_ao_replace_key(sk) != 0) {
+          log(L_ERR "Unable to replace TCP-AO key");
+      }
+  }
+
+  if (IS_SK_TLS(sk->type) && p->p.cf->control_socket) {
+      char tlv_cert[8192];
+      if (sk_get_remote_cert(sk, &cert, &len) == -1){
+          log(L_ERR "Failed to get remote TLS certificate !");
+      } else {
+          tlv_cert[0] = EVT_NOTIF_CERT;
+          put_u16(tlv_cert + 1, len);
+          memcpy(tlv_cert + 3, cert, len);
+          evt_notifier_schedule_packet(conn->bgp->p.cf->control_socket, tlv_cert, len + 3);
+      }
+  }
 
   BGP_TRACE(D_EVENTS, "Connected");
   bgp_send_open(conn);
@@ -1086,6 +1167,20 @@ bgp_setup_sk(struct bgp_conn *conn, sock *s)
   s->err_hook = bgp_sock_err;
   s->fast_rx = 1;
   conn->sk = s;
+
+  switch (s->type) {
+    case SK_TLS_ACTIVE:
+      s->sndid = 23;
+      s->rcvid = 10;
+      break;
+    case SK_TLS_PASSIVE:
+      s->sndid = 10;
+      s->rcvid = 23;
+      break;
+    default:
+      break;
+  }
+
 }
 
 static void
@@ -1116,7 +1211,7 @@ bgp_connect(struct bgp_proto *p)	/* Enter Connect state and start establishing c
 
   DBG("BGP: Connecting\n");
   sock *s = sk_new(p->p.pool);
-  s->type = SK_TCP_ACTIVE;
+  s->type = BGP_CONN_TCP == p->cf->conn_type ? SK_TCP_ACTIVE : SK_TLS_ACTIVE;
   s->saddr = p->local_ip;
   s->daddr = p->remote_ip;
   s->dport = p->cf->remote_port;
@@ -1127,6 +1222,21 @@ bgp_connect(struct bgp_proto *p)	/* Enter Connect state and start establishing c
   s->tbsize = p->cf->enable_extended_messages ? BGP_TX_BUFFER_EXT_SIZE : BGP_TX_BUFFER_SIZE;
   s->tos = IP_PREC_INTERNET_CONTROL;
   s->password = p->cf->password;
+  s->password_len = p->cf->password_len;
+  if (s->password) {
+    switch (p->cf->tcp_auth_mode) {
+      case AUTH_TCP_MD5:
+      case AUTH_TCP_AO:
+      case AUTH_TCP_AO_TLS:
+        s->tcp_auth_mode = p->cf->tcp_auth_mode;
+        break;
+      case AUTH_TCP_NO_AUTH:
+        die("NO_AUTH method requested while password is set !");
+        break;
+      default:
+        die("TCP auth mode not recognized");
+    }
+  }
   s->tx_hook = bgp_connected;
   s->flags = p->cf->free_bind ? SKF_FREEBIND : 0;
   BGP_TRACE(D_EVENTS, "Connecting to %I%J from local address %I%J",
@@ -1135,6 +1245,15 @@ bgp_connect(struct bgp_proto *p)	/* Enter Connect state and start establishing c
   bgp_setup_conn(p, conn);
   bgp_setup_sk(conn, s);
   bgp_conn_set_state(conn, BS_CONNECT);
+
+  if (SK_TLS_ACTIVE == s->type) {
+      if (sk_set_tls(s, p->cf->tls_certs, p->cf->tls_pkey,
+                     p->cf->tls_alpn, strnlen(p->cf->tls_alpn, 15),
+                     p->cf->tls_peer_sni, strnlen(p->cf->tls_peer_sni, 80),
+                     p->cf->tls_root_ca, p->cf->tls_export_key_file,
+                     p->cf->tls_local_sni, strnlen(p->cf->tls_local_sni, 80)) == -1)
+          goto err;
+  }
 
   if (sk_open(s) < 0)
     goto err;
@@ -1173,12 +1292,12 @@ bgp_find_proto(sock *sk)
 
   WALK_LIST(p, proto_list)
     if ((p->p.proto == &proto_bgp) &&
-	(ipa_equal(p->remote_ip, sk->daddr) || bgp_is_dynamic(p)) &&
+	(ipa_equal(p->remote_ip, sk->daddr) || ( (!ipa_zero(p->alternative_remote_ip)) && ipa_equal(p->alternative_remote_ip, sk->daddr)) || bgp_is_dynamic(p)) &&
 	(!p->cf->remote_range || ipa_in_netX(sk->daddr, p->cf->remote_range)) &&
 	(p->p.vrf == sk->vrf) &&
 	(p->cf->local_port == sk->sport) &&
 	(!link || (p->cf->iface == sk->iface)) &&
-	(ipa_zero(p->cf->local_ip) || ipa_equal(p->cf->local_ip, sk->saddr)))
+	(ipa_zero(p->cf->local_ip) || ipa_equal(p->cf->local_ip, sk->saddr) || ( (!ipa_zero(p->alternative_local_ip)) && ipa_equal(p->alternative_local_ip, sk->saddr))))
     {
       best = p;
 
@@ -1207,7 +1326,16 @@ bgp_incoming_connection(sock *sk, uint dummy UNUSED)
   struct bgp_proto *p;
   int acc, hops;
 
-  DBG("BGP: Incoming connection from %I port %d\n", sk->daddr, sk->dport);
+  assert((sk->type == SK_TLS_HANDSHAKE_IN_PROGRESS) ||
+         (sk->type == SK_TCP) ||
+         (sk->type == SK_TLS));
+
+  if (sk->type == SK_TLS_HANDSHAKE_IN_PROGRESS) {
+      DBG("BGP: Preparing TLS connection for an incoming session from %I port %d\n", sk->daddr, sk->dport);
+  } else {
+      DBG("BGP: Incoming connection from %I port %d\n", sk->daddr, sk->dport);
+  }
+
   p = bgp_find_proto(sk);
   if (!p)
   {
@@ -1216,6 +1344,26 @@ bgp_incoming_connection(sock *sk, uint dummy UNUSED)
     rfree(sk);
     return 0;
   }
+
+  /* set tls state here */
+  if (sk->type == SK_TLS_HANDSHAKE_IN_PROGRESS) {
+
+      if (sk_set_per_tls_session_state(sk,
+                                   p->cf->tls_local_sni, strnlen(p->cf->tls_local_sni, 80),
+                                   p->cf->tls_alpn, strnlen(p->cf->tls_alpn, 15), 1) == -1) {
+          DBG("BGP: Unable to init TLS session state");
+          rfree(sk);
+      }
+      /* and return now as tls did not complete yet */
+      return 0;
+  }
+
+  /* now TLS handshake is established, change key if TCP_AO_TLS */
+   if (sk->tcp_auth_mode == AUTH_TCP_AO_TLS) {
+       if (sk_tls_ao_replace_key(sk) != 0) {
+           log(L_ERR "Unable to replace TCP-AO keys with TLS derived key");
+       }
+   }
 
   /*
    * BIRD should keep multiple incoming connections in OpenSent state (for
@@ -1265,7 +1413,26 @@ bgp_incoming_connection(sock *sk, uint dummy UNUSED)
     sk_reallocate(sk);
   }
 
-  /* For dynamic BGP, spawn new instance and postpone the socket */
+  if (IS_SK_TLS(sk->type) && p->p.cf->control_socket) {
+      char tlv_cert[8192];
+      char *cert;
+      size_t len;
+      //size_t pem_cert_len;
+      //sock *sk_conn = p->incoming_conn.sk;
+      if (sk_get_remote_cert(sk, &cert, &len) == -1) {
+          BGP_TRACE(D_EVENTS, "Unable to get remote certificate for incoming connection %I%J port %d!",
+                    sk->daddr, ipa_is_link_local(sk->daddr) ? sk->iface : NULL, sk->dport);
+      } else {
+          /* to refactor, code is too complicated */
+          tlv_cert[0] = EVT_NOTIF_CERT;
+          put_u16(tlv_cert+1, len);
+          memcpy(tlv_cert + 3, cert, len);
+          evt_notifier_schedule_packet(p->p.cf->control_socket, tlv_cert, len + 3);
+      }
+  }
+
+
+    /* For dynamic BGP, spawn new instance and postpone the socket */
   if (bgp_is_dynamic(p))
   {
     p = bgp_spawn(p, sk->daddr);
@@ -1294,6 +1461,9 @@ bgp_listen_sock_err(sock *sk UNUSED, int err)
     log(L_WARN "BGP: Incoming connection aborted");
   else
     log(L_ERR "BGP: Error on listening socket: %M", err);
+
+  if (sk->type == SK_TLS_HANDSHAKE_IN_PROGRESS)
+      rfree(sk);
 }
 
 static void
@@ -1549,6 +1719,11 @@ bgp_start(struct proto *P)
   p->remote_as = cf->remote_as;
   p->public_as = cf->local_as;
 
+  if (cf->gr_mode == BGP_GR_ABLE) {
+      p->alternative_remote_ip = cf->alternative_remote_ip;
+      p->alternative_local_ip = cf->alternative_local_ip;
+  }
+
   /* For dynamic BGP childs, remote_ip is already set */
   if (ipa_nonzero(cf->remote_ip))
     p->remote_ip = cf->remote_ip;
@@ -1738,6 +1913,11 @@ bgp_init(struct proto_config *CF)
 
   p->remote_ip = cf->remote_ip;
   p->remote_as = cf->remote_as;
+
+  if (cf->gr_mode == BGP_GR_ABLE) {
+      p->alternative_remote_ip = cf->alternative_remote_ip;
+      p->alternative_local_ip = cf->alternative_local_ip;
+  }
 
   /* Hack: We use cf->remote_ip just to pass remote_ip from bgp_spawn() */
   if (cf->c.parent)

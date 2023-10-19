@@ -156,17 +156,29 @@ mrt_put_data(buffer *b, const void *src, size_t n)
 static void
 mrt_init_message(buffer *b, u16 type, u16 subtype)
 {
+  btime realtime;
+  btime realtime_s;
+  btime realtime_us_off;
+
   /* Reset buffer */
   mrt_buffer_flush(b);
-  mrt_buffer_need(b, MRT_HDR_LENGTH);
+  mrt_buffer_need(b, MRT_HDR_LENGTH + (IS_MRT_TYPE_ET(type) ? MRT_USEC_TIMESTAMP_LEN : 0));
+
+  realtime = current_real_time();
+  realtime_s = realtime TO_S;
 
   /* Prepare header */
-  mrt_put_u32_(b, current_real_time() TO_S); /* now_real */
+  mrt_put_u32_(b, realtime_s); /* now_real */
   mrt_put_u16_(b, type);
   mrt_put_u16_(b, subtype);
 
   /* Message length, will be fixed later */
   mrt_put_u32_(b, 0);
+
+  if (IS_MRT_TYPE_ET(type)) {
+      realtime_us_off = realtime - realtime_s S;
+      mrt_put_u32_(b, realtime_us_off);
+  }
 }
 
 static void
@@ -791,7 +803,7 @@ mrt_bgp_header(buffer *b, struct mrt_bgp_data *d)
 }
 
 void
-mrt_dump_bgp_message(struct mrt_bgp_data *d)
+mrt_dump_bgp_message(struct mrt_bgp_data *d, int extended_ts, int is_local)
 {
   const u16 subtypes[] = {
     MRT_BGP4MP_MESSAGE,			MRT_BGP4MP_MESSAGE_AS4,
@@ -801,14 +813,14 @@ mrt_dump_bgp_message(struct mrt_bgp_data *d)
   };
 
   buffer *b = mrt_bgp_buffer();
-  mrt_init_message(b, MRT_BGP4MP, subtypes[d->as4 + 4*d->add_path]);
+  mrt_init_message(b, extended_ts == 1 ? MRT_BGP4MP_ET : MRT_BGP4MP, subtypes[((is_local != 0) * 2) + (d->as4 + 4 * d->add_path)]);
   mrt_bgp_header(b, d);
   mrt_put_data(b, d->message, d->msg_len);
   mrt_dump_message(b, config->mrtdump_file);
 }
 
 void
-mrt_dump_bgp_state_change(struct mrt_bgp_data *d)
+mrt_dump_bgp_state_change(struct mrt_bgp_data *d, int extended_ts)
 {
   /* Convert state from our BS_* values to values used in MRTDump */
   const u16 states[BS_MAX] = {1, 2, 3, 4, 5, 6, 1};
@@ -820,7 +832,7 @@ mrt_dump_bgp_state_change(struct mrt_bgp_data *d)
   d->as4 = 1;
 
   buffer *b = mrt_bgp_buffer();
-  mrt_init_message(b, MRT_BGP4MP, MRT_BGP4MP_STATE_CHANGE_AS4);
+  mrt_init_message(b, extended_ts ? MRT_BGP4MP_ET : MRT_BGP4MP, MRT_BGP4MP_STATE_CHANGE_AS4);
   mrt_bgp_header(b, d);
   mrt_put_u16(b, states[d->old_state]);
   mrt_put_u16(b, states[d->new_state]);

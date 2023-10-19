@@ -126,7 +126,9 @@ struct proto_config {
   u8 disabled;				/* Protocol enabled/disabled by default */
   u8 vrf_set;				/* Related VRF instance (below) is defined */
   u32 debug, mrtdump;			/* Debugging bitfields, both use D_* constants */
+  u8 mrtdump_et;            /* Enable extended timestamp record */
   u32 router_id;			/* Protocol specific router ID */
+  struct evt_notifier *control_socket;
 
   list channels;			/* List of channel configs (struct channel_config) */
   struct iface *vrf;			/* Related VRF instance, NULL if global */
@@ -180,6 +182,7 @@ struct proto {
   const char *name;				/* Name of this instance (== cf->name) */
   u32 debug;				/* Debugging flags */
   u32 mrtdump;				/* MRTDump flags */
+  u8 mrtdump_et;            /* Indicate if MRT dump should be generated with extended timestamp record */
   uint active_channels;			/* Number of active channels */
   byte net_type;			/* Protocol network type (NET_*), 0 for undefined */
   byte disabled;			/* Manually disabled */

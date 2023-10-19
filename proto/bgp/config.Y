@@ -32,7 +32,9 @@ CF_KEYWORDS(BGP, LOCAL, NEIGHBOR, AS, HOLD, TIME, CONNECT, RETRY, KEEPALIVE,
 	LIVED, STALE, IMPORT, IBGP, EBGP, MANDATORY, INTERNAL, EXTERNAL, SETS,
 	DYNAMIC, RANGE, NAME, DIGITS, BGP_AIGP, AIGP, ORIGINATE, COST, ENFORCE,
 	FIRST, FREE, VALIDATE, BASE, ROLE, ROLES, PEER, PROVIDER, CUSTOMER,
-	RS_SERVER, RS_CLIENT, REQUIRE, BGP_OTC, GLOBAL)
+	RS_SERVER, RS_CLIENT, REQUIRE, BGP_OTC, GLOBAL, TLS, CERTIFICATE, PKEY, SNI,
+	TRANSPORT, ALPN, ROOT, CA, SECRETS, LOCAL, AUTHENTICATION, MODE, TCP_AO,
+	TCP_MD5, TCP_AO_TLS, TCP_NO_AUTH, ALTERNATIVE)
 
 %type <i> bgp_nh
 %type <i32> bgp_afi
@@ -45,7 +47,30 @@ CF_KEYWORDS(CEASE, PREFIX, LIMIT, HIT, ADMINISTRATIVE, SHUTDOWN, RESET, PEER,
 
 CF_GRAMMAR
 
-proto: bgp_proto '}'  ;
+proto: bgp_proto '}' {
+  switch (BGP_CFG->tcp_auth_mode) {
+    case AUTH_TCP_NO_AUTH:
+      if (BGP_CFG->password) {
+        cf_error("Password set but no authentication method choosen");
+      }
+      break;
+    case AUTH_TCP_AO_TLS:
+      if (BGP_CFG->conn_type != BGP_CONN_TLS) {
+        cf_error("Requested opportunistic TCP-AO with TLS, but transport is not TLS");
+      }
+      // set initial master key
+      BGP_CFG->password = tls_ao_initial;
+      BGP_CFG->password_len = tls_ao_initial_len;
+      break;
+    case AUTH_TCP_AO:
+      if (!BGP_CFG->password) {
+        cf_error("TCP-AO requested but no password provided");
+      }
+      break;
+    default:
+      break;
+  }
+} ;
 
 bgp_proto_start: proto_start BGP {
      this_proto = proto_config_new(&proto_bgp, $1);
@@ -77,6 +102,15 @@ bgp_proto_start: proto_start BGP {
      BGP_CFG->local_role = BGP_ROLE_UNDEFINED;
      BGP_CFG->dynamic_name = "dynbgp";
      BGP_CFG->check_link = -1;
+     BGP_CFG->tls_certs = NULL;
+     BGP_CFG->tls_pkey = NULL;
+     BGP_CFG->tls_alpn = "botls";
+     BGP_CFG->tls_peer_sni = NULL;
+     BGP_CFG->tls_local_sni = NULL;
+     BGP_CFG->conn_type = BGP_CONN_TCP;
+     BGP_CFG->tls_root_ca = NULL;
+     BGP_CFG->tls_export_key_file = NULL;
+     BGP_CFG->tcp_auth_mode = AUTH_TCP_NO_AUTH;
    }
  ;
 
@@ -149,6 +183,12 @@ bgp_proto:
      net_copy(n, &($4));
      BGP_CFG->remote_range = n;
    }
+ | bgp_proto ALTERNATIVE NEIGHBOR ipa LOCAL ipa ';' {
+    if (ipa_nonzero(BGP_CFG->alternative_remote_ip))
+      cf_error("Only one alternative neighbor IP is supported now");
+    BGP_CFG->alternative_remote_ip = $4;
+    BGP_CFG->alternative_local_ip = $6;
+ }
  | bgp_proto INTERFACE TEXT ';' { BGP_CFG->iface = if_get_by_name($3); }
  | bgp_proto RR CLUSTER ID idval ';' { BGP_CFG->rr_cluster_id = $5; }
  | bgp_proto RR CLIENT bool ';' { BGP_CFG->rr_client = $4; }
@@ -192,7 +232,8 @@ bgp_proto:
  | bgp_proto ENABLE EXTENDED MESSAGES bool ';' { BGP_CFG->enable_extended_messages = $5; }
  | bgp_proto ADVERTISE HOSTNAME bool ';' { BGP_CFG->enable_hostname = $4; }
  | bgp_proto CAPABILITIES bool ';' { BGP_CFG->capabilities = $3; }
- | bgp_proto PASSWORD text ';' { BGP_CFG->password = $3; }
+ | bgp_proto PASSWORD text ';' { BGP_CFG->password = $3; BGP_CFG->password_len = strlen($3); }
+ | bgp_proto TCP AUTHENTICATION MODE bgp_tcp_auth_mode ';'
  | bgp_proto SETKEY bool ';' { BGP_CFG->setkey = $3; }
  | bgp_proto PASSIVE bool ';' { BGP_CFG->passive = $3; }
  | bgp_proto INTERPRET COMMUNITIES bool ';' { BGP_CFG->interpret_communities = $4; }
@@ -215,6 +256,26 @@ bgp_proto:
  | bgp_proto ENFORCE FIRST AS bool ';' { BGP_CFG->enforce_first_as = $5; }
  | bgp_proto LOCAL ROLE bgp_role_name ';' { BGP_CFG->local_role = $4; }
  | bgp_proto REQUIRE ROLES bool ';' { BGP_CFG->require_roles = $4; }
+ | bgp_proto TLS CERTIFICATE text ';' { BGP_CFG->tls_certs = $4; }
+ | bgp_proto TLS PKEY text ';' { BGP_CFG->tls_pkey = $4; }
+ | bgp_proto TLS PEER SNI text ';' { BGP_CFG->tls_peer_sni = $5; }
+ | bgp_proto TLS LOCAL SNI text ';' { BGP_CFG->tls_local_sni = $5; }
+ | bgp_proto TLS ALPN text ';' { BGP_CFG->tls_alpn = $4; }
+ | bgp_proto TRANSPORT bgp_transport_type ';'
+ | bgp_proto TLS ROOT CA text ';' { BGP_CFG->tls_root_ca = $5; }
+ | bgp_proto TLS EXPORT SECRETS text ';' { BGP_CFG->tls_export_key_file = $5; }
+ ;
+
+bgp_transport_type:
+   TLS { BGP_CFG->conn_type = BGP_CONN_TLS; }
+ | TCP  { BGP_CFG->conn_type = BGP_CONN_TCP; }
+ ;
+
+bgp_tcp_auth_mode:
+   TCP_NO_AUTH { BGP_CFG->tcp_auth_mode = AUTH_TCP_NO_AUTH; }
+ | TCP_AO { BGP_CFG->tcp_auth_mode = AUTH_TCP_AO; }
+ | TCP_MD5 { BGP_CFG->tcp_auth_mode = AUTH_TCP_MD5; }
+ | TCP_AO_TLS { BGP_CFG->tcp_auth_mode = AUTH_TCP_AO_TLS; }
  ;
 
 bgp_afi:

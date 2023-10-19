@@ -79,6 +79,8 @@ struct bgp_config {
   u32 local_as, remote_as;
   ip_addr local_ip;			/* Source address to use */
   ip_addr remote_ip;
+  ip_addr alternative_remote_ip;
+  ip_addr alternative_local_ip;
   struct iface *iface;			/* Interface for link-local addresses */
   u16 local_port;			/* Local listening port */
   u16 remote_port; 			/* Neighbor destination port */
@@ -134,11 +136,21 @@ struct bgp_config {
   u32 disable_after_cease;		/* Disable it when cease is received, bitfield */
 
   const char *password;			/* Password used for MD5 authentication */
+  size_t password_len;
+  int tcp_auth_mode;
   net_addr *remote_range;		/* Allowed neighbor range for dynamic BGP */
   const char *dynamic_name;		/* Name pattern for dynamic BGP */
   int dynamic_name_digits;		/* Minimum number of digits for dynamic names */
   int check_link;			/* Use iface link state for liveness detection */
   struct bfd_options *bfd;		/* Use BFD for liveness detection */
+  const char *tls_pkey;
+  const char *tls_certs;
+  const char *tls_alpn;
+  const char *tls_peer_sni;
+  const char *tls_local_sni;
+  const char *tls_root_ca;
+  const char *tls_export_key_file;
+  int conn_type;
 };
 
 struct bgp_channel_config {
@@ -313,6 +325,8 @@ struct bgp_proto {
   struct proto p;
   const struct bgp_config *cf;		/* Shortcut to BGP configuration */
   ip_addr local_ip, remote_ip;
+  ip_addr alternative_remote_ip; /* assume one alternative IP for now */
+  ip_addr alternative_local_ip;
   u32 local_as, remote_as;
   u32 public_as;			/* Externally visible ASN (local_as or confederation id) */
   u32 local_id;				/* BGP identifier of this router */
@@ -333,6 +347,7 @@ struct bgp_proto {
   u8 gr_active_num;			/* Neighbor is doing GR, number of active channels */
   u8 channel_count;			/* Number of active channels */
   u8 summary_add_path_rx;		/* Summary state of ADD_PATH RX w.r.t active channels */
+  u8 summary_add_path_tx;		/* Summary state of ADD_PATH TX w.r.t active channels */
   u32 *afi_map;				/* Map channel index -> AFI */
   struct bgp_channel **channel_map;	/* Map channel index -> channel */
   struct bgp_conn *conn;		/* Connection we have established */
@@ -510,6 +525,13 @@ struct bgp_parse_state {
 #define BGP_MSG_HDR_LENGTH_POS	BGP_MSG_HDR_MARKER_SIZE
 #define BGP_MSG_HDR_TYPE_SIZE	1
 #define BGP_MSG_HDR_TYPE_POS	(BGP_MSG_HDR_MARKER_SIZE + BGP_MSG_HDR_LENGTH_SIZE)
+
+
+enum {
+    BGP_CONN_TCP,
+    BGP_CONN_TLS
+};
+
 
 static inline int bgp_channel_is_ipv4(struct bgp_channel *c)
 { return BGP_AFI(c->afi) == BGP_AFI_IPV4; }

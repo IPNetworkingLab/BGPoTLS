@@ -113,12 +113,16 @@ struct mrt_bgp_data {
 #define MRT_HDR_LENGTH		12	/* MRT Timestamp + MRT Type + MRT Subtype + MRT Load Length */
 #define MRT_PEER_TYPE_32BIT_ASN	2	/* MRT Table Dump: Peer Index Table: Peer Type: Use 32bit ASN */
 #define MRT_PEER_TYPE_IPV6	1	/* MRT Table Dump: Peer Index Table: Peer Type: Use IPv6 IP Address */
+#define MRT_USEC_TIMESTAMP_LEN 4 /* Length of the MRT us timestamp record */
 
 #define MRT_ATTR_BUFFER_SIZE	65536
 
 /* MRT Types */
 #define MRT_TABLE_DUMP_V2 	13
 #define MRT_BGP4MP		16
+#define MRT_BGP4MP_ET   17
+
+#define IS_MRT_TYPE_ET(t) ((t) == MRT_BGP4MP_ET)
 
 /* MRT Table Dump v2 Subtypes */
 #define MRT_PEER_INDEX_TABLE		1
@@ -147,8 +151,8 @@ struct mrt_bgp_data {
 
 #ifdef CONFIG_MRT
 void mrt_dump_cmd(struct mrt_dump_data *d);
-void mrt_dump_bgp_message(struct mrt_bgp_data *d);
-void mrt_dump_bgp_state_change(struct mrt_bgp_data *d);
+void mrt_dump_bgp_message(struct mrt_bgp_data *d, int extended_ts, int is_local);
+void mrt_dump_bgp_state_change(struct mrt_bgp_data *d, int extended_ts);
 void mrt_check_config(struct proto_config *C);
 #else
 static inline void mrt_dump_bgp_message(struct mrt_bgp_data *d UNUSED) { }

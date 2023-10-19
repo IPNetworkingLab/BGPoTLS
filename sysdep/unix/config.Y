@@ -9,6 +9,7 @@
 CF_HDR
 
 #include "sysdep/unix/unix.h"
+#include "lib/evt_notifier.h"
 #include <stdio.h>
 
 CF_DEFINES
@@ -20,6 +21,7 @@ CF_DECLS
 CF_KEYWORDS(LOG, SYSLOG, ALL, DEBUG, TRACE, INFO, REMOTE, WARNING, ERROR, AUTH, FATAL, BUG, STDERR, SOFT)
 CF_KEYWORDS(NAME, CONFIRM, UNDO, CHECK, TIMEOUT, DEBUG, LATENCY, LIMIT, WATCHDOG, WARNING, STATUS)
 CF_KEYWORDS(GRACEFUL, RESTART, THREADS)
+CF_KEYWORDS(CONTROL, SOCKET)
 
 %type <i> log_mask log_mask_list log_cat cfg_timeout
 %type <t> cfg_name
@@ -101,6 +103,7 @@ mrtdump_base:
        new_config->mrtdump_file = rf_fileno(f);
      }
    }
+ | MRTDUMP EXTENDED_TIMESTAMP bool ';' { new_config->proto_default_mrtdump_et = $3; }
  ;
 
 
@@ -113,6 +116,16 @@ debug_unix:
  | WATCHDOG TIMEOUT expr_us { new_config->watchdog_timeout = ($3 + 999999) TO_S; }
  ;
 
+
+conf: control_socket ;
+
+control_socket:
+   CONTROL SOCKET text ';' {
+       struct evt_notifier *evt = evt_notifier_new($3);
+       if (!evt) cf_error("Unable to create notifier event '%s'", $3);
+       new_config->control_socket = evt;
+   }
+   ;
 
 /* Unix specific commands */
 

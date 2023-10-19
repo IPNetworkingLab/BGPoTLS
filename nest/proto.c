@@ -1081,6 +1081,7 @@ proto_new(struct proto_config *cf)
   p->cf = cf;
   p->debug = cf->debug;
   p->mrtdump = cf->mrtdump;
+  p->mrtdump_et = cf->mrtdump_et;
   p->name = cf->name;
   p->proto = cf->protocol;
   p->net_type = cf->net_type;
@@ -1155,6 +1156,8 @@ proto_config_new(struct protocol *pr, int class)
   cf->class = class;
   cf->debug = new_config->proto_default_debug;
   cf->mrtdump = new_config->proto_default_mrtdump;
+  cf->mrtdump_et = new_config->proto_default_mrtdump_et;
+  cf->control_socket = new_config->control_socket;
 
   init_list(&cf->channels);
 
@@ -1277,6 +1280,7 @@ proto_reconfigure(struct proto *p, struct proto_config *oc, struct proto_config 
   p->name = nc->name;
   p->debug = nc->debug;
   p->mrtdump = nc->mrtdump;
+  p->mrtdump = nc->mrtdump_et;
   reconfigure_type = type;
 
   /* Execute protocol specific reconfigure hook */

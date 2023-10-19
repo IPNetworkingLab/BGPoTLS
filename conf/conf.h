@@ -34,6 +34,7 @@ struct config {
   u32 router_id;			/* Our Router ID */
   u32 proto_default_debug;		/* Default protocol debug mask */
   u32 proto_default_mrtdump;		/* Default protocol mrtdump mask */
+  u8 proto_default_mrtdump_et;		/* Enable extended timestamp record */
   u32 channel_default_debug;		/* Default channel debug mask */
   struct timeformat tf_route;		/* Time format for 'show route' */
   struct timeformat tf_proto;		/* Time format for 'show protocol' */
@@ -60,6 +61,8 @@ struct config {
   int shutdown;				/* This is a pseudo-config for daemon shutdown */
   int gr_down;				/* This is a pseudo-config for graceful restart */
   btime load_time;			/* When we've got this configuration */
+
+  struct evt_notifier *control_socket;
 };
 
 /* Please don't use these variables in protocols. Use proto_config->global instead. */

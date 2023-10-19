@@ -607,6 +607,13 @@ include "tablename.conf";;
 	Set global defaults of MRTdump options. See <cf/mrtdump/ in the
 	following section. Default: off.
 
+	<tag><label id="opt-mrtdump-et">mrtdump extended_timestamp <m/switch/</tag>
+	Enables the generation of MRT records with the extended timestamp MRT header.
+	If the protocol supports the extended timestamp format, the record is generated
+	with the microsecond header field. This allows measurements with microsecond
+	resolution. Currently, only BGP supports the extended timestamp format header.
+	Default: off.
+
 	<tag><label id="opt-filter">filter <m/name local variables/{ <m/commands/ }</tag>
 	Define a filter. You can learn more about filters in the following
 	chapter.

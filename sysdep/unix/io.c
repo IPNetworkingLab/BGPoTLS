@@ -41,8 +41,11 @@
 #include "nest/iface.h"
 #include "conf/conf.h"
 
+#include <picotls.h>
+
 #include "sysdep/unix/unix.h"
 #include CONFIG_INCLUDE_SYSIO_H
+#include "tls_helpers.h"
 
 /* Maximum number of calls of tx handler for one socket in one
  * poll iteration. Should be small enough to not monopolize CPU by
@@ -734,6 +737,124 @@ sk_log_error(sock *s, const char *p)
 }
 
 
+int sk_set_tls_cert(sock *s, const char *cert_location) {
+    return tls_set_certs(&s->tls_ctx, s->certs,
+                         sizeof(s->certs)/sizeof(s->certs[0]), cert_location);
+}
+
+int sk_set_tls_private_key(sock *s, const char *pkey_location) {
+    return tls_set_pkey(&s->tls_ctx,
+                        pkey_location,
+                        s->tls_sign_obj,
+                        sizeof(s->tls_sign_obj)/sizeof(s->tls_sign_obj[0]));
+}
+
+int sk_set_alpn(sock *s, const char *alpn, size_t alpn_len) {
+    return tls_set_alpn(s->tls->tls, alpn, alpn_len);
+}
+
+int sk_set_peer_sni(sock *s, const char *sni, size_t sni_len) {
+    return ptls_set_server_name(s->tls->tls, sni, sni_len);
+}
+
+int sk_get_remote_cert(sock *s, char **const cert, size_t *len) {
+    return tls_get_remote_cert(s->tls, cert, len);
+}
+
+int sk_set_root_ca(sock *s, const char *root_ca) {
+    return tls_set_root_ca(&s->tls_ctx, s->tls_verif_obj,
+                           sizeof(s->tls_verif_obj) / sizeof(s->tls_verif_obj[0]),
+                           root_ca, &s->verif_x509_store);
+}
+
+int sk_local_cert_to_pem(sock *s, char *pem_buf, size_t *pem_buf_len) {
+    return tls_cert_to_pem(&s->certs[0], pem_buf, pem_buf_len);
+}
+
+int sk_set_export_key(sock *s, const char *export_file) {
+    if (!export_file) return 0;
+    return tls_setup_log_event(&s->tls_ctx, &s->log_evt, export_file);
+}
+
+int sk_set_per_tls_session_state(sock *s, const char *sni, size_t sni_len,
+                             const char *alpn, size_t alpn_len, int is_server)  {
+
+    assert(!s->tls);
+
+    if ((s->tls = tls_ref_new(&s->tls_ctx, is_server)) == NULL)
+        goto err;
+
+    tls_set_verifier_ctx(s->tls_verif_obj, s->tls);
+
+    if (sk_set_alpn(s, alpn, alpn_len) == -1)
+        goto err;
+    if (sk_set_peer_sni(s, sni, sni_len) == -1)
+        goto err;
+
+    return 0;
+    err:
+    return -1;
+}
+
+int sk_set_tls(sock *s, const char *cert_location, const char *pkey_location,
+               const char *alpn, size_t alpn_len, const char *peer_sni,
+               size_t peer_sni_len, const char *root_ca, const char *export_keys,
+               const char *local_sni, size_t local_sni_len) {
+
+    /* static int fd_log = -1; */
+
+    if (s->type != SK_TLS_PASSIVE && s->type != SK_TLS_ACTIVE) {
+        goto err;
+    }
+    if (s->tls) {
+        fprintf(stderr, "TLS context already init !\n");
+        if (!s->passive_sock) {
+            fprintf(stderr, "Illegal state\n");
+            goto err; // already init !
+        } else  {
+            tls_ref_inc(s->tls);
+            return 0;
+        }
+    }
+
+    tls_init(&s->tls_ctx);
+
+
+    /*if (fd_log ==-1) {
+        fd_log = open("/tmp/ptls.log", O_RDWR | O_CREAT | O_APPEND);
+        if (fd_log == -1) {
+            die("open");
+        }
+        ptls_log_add_fd(fd_log);
+    }*/
+
+    if (sk_set_tls_cert(s, cert_location) == -1)
+        goto err;
+    if (sk_set_tls_private_key(s,pkey_location) == -1)
+        goto err;
+    if (sk_set_root_ca(s, root_ca) == -1)
+        goto err;
+    if (sk_set_export_key(s, export_keys) == -1)
+        goto err;
+
+    if (s->type == SK_TLS_PASSIVE){
+        s->tls_ctx.require_client_authentication = 1;
+        s->tls = NULL; // make sure passive sockets do not have tls session state
+
+        /* and that's it ! tls session state
+         * will be initiated upon accept() */
+        return 0;
+    }
+
+    if (sk_set_per_tls_session_state(s, peer_sni, peer_sni_len, alpn,
+                                     alpn_len, s->type == SK_TLS_PASSIVE ? 1 : 0) == -1)
+        goto err;
+
+    return 0;
+    err:
+    return -1;
+}
+
 /*
  *	Actual struct birdsock code
  */
@@ -760,6 +881,24 @@ sk_alloc_bufs(sock *s)
   if (!s->tbuf && s->tbsize)
     s->tbuf = s->tbuf_alloc = xmalloc(s->tbsize);
   s->tpos = s->ttx = s->tbuf;
+
+  /* tls enabled socket */
+  if (IS_SK_TLS(s->type)) {
+      if (!s->encrypted_send_buf && s->tbsize) {
+          s->encrypted_send_buf = xmalloc(s->tbsize * 2);
+          s->encrypted_send_pos = s->encrypted_send_buf;
+          s->encrypted_send_off = s->encrypted_send_buf;
+          s->encrypted_send_buf_len = s->tbsize * 2;
+          ptls_buffer_init(&s->sendbuf, s->encrypted_send_buf, s->tbsize * 2);
+      }
+      if (!s->recv_plain_txt && s->rbsize) {
+          assert(s->rbsize);
+          s->recv_plain_txt = xmalloc(MAX_MTU);
+          s->recv_txt_pos = s->recv_plain_txt;
+          s->recv_plain_txt_len = MAX_MTU;
+          ptls_buffer_init(&s->recvbuf, s->rbuf, s->rbsize);
+      }
+  }
 }
 
 static void
@@ -774,6 +913,19 @@ sk_free_bufs(sock *s)
   {
     xfree(s->tbuf_alloc);
     s->tbuf = s->tbuf_alloc = NULL;
+  }
+  if (IS_SK_TLS(s->type)) {
+      if (s->encrypted_send_buf) {
+          ptls_buffer_dispose(&s->sendbuf);
+          xfree(s->encrypted_send_buf);
+          s->encrypted_send_buf = NULL;
+      }
+      if (s->recv_plain_txt) {
+          if (s->rbuf) ptls_buffer_dispose(&s->recvbuf);
+          xfree(s->recv_plain_txt);
+          s->recv_plain_txt = NULL;
+          s->recv_plain_txt_len = 0;
+      }
   }
 }
 
@@ -816,6 +968,16 @@ sk_free(resource *r)
   if (s->type == SK_SSH || s->type == SK_SSH_ACTIVE)
     sk_ssh_free(s);
 #endif
+
+  if (s->tls) {
+      tls_ref_dec(s->tls);
+      s->tls = NULL;
+  }
+
+  if (s->verif_x509_store) {
+      tls_free_verif_store(s->verif_x509_store);
+      s->verif_x509_store = NULL;
+  }
 
   if (s->fd < 0)
     return;
@@ -938,6 +1100,9 @@ sk_setup(sock *s)
   if (s->type == SK_SSH_ACTIVE)
     return 0;
 
+  if (s->type == SK_UNIX_ACTIVE)
+    return 0;
+
   if (fcntl(fd, F_SETFL, O_NONBLOCK) < 0)
     ERR("O_NONBLOCK");
 
@@ -1009,7 +1174,8 @@ sk_setup(sock *s)
 
   if (sk_is_ipv6(s))
   {
-    if ((s->type == SK_TCP_PASSIVE) || (s->type == SK_TCP_ACTIVE) || (s->type == SK_UDP))
+    if ((s->type == SK_TCP_PASSIVE) || (s->type == SK_TCP_ACTIVE) || (s->type == SK_UDP) ||
+        (IS_SK_TLS(s->type)))
       if (setsockopt(fd, SOL_IPV6, IPV6_V6ONLY, &y, sizeof(y)) < 0)
 	ERR("IPV6_V6ONLY");
 
@@ -1063,6 +1229,75 @@ sk_tcp_connected(sock *s)
   s->tx_hook(s);
 }
 
+static int
+tls_dummy_rx(sock *sk UNUSED, uint size UNUSED) {
+    die("Internal error: %s function should NEVER be called", __FUNCTION__);
+    return -1;
+}
+
+static void
+tls_dummy_tx(sock *sk UNUSED) {
+    die("Internal error: %s function should NEVER be called", __FUNCTION__);
+}
+
+static void
+sk_unix_connected(sock *s) {
+    s->type = SK_UNIX;
+    sk_alloc_bufs(s);
+    s->tx_hook(s);
+}
+
+int sk_open_active_unix(sock *sk, const char *control_path) {
+    size_t check_size;
+
+    if (sk->type != SK_UNIX_ACTIVE) {
+        return -1;
+    }
+
+    check_size = strnlen(control_path, 109);
+    if (check_size > 108) {
+        return -1;
+    }
+
+    sk->host = mb_allocz(sk->pool, check_size + 1);
+    strncpy((char *) sk->host, control_path, check_size); /* Yes, I know this is ugly cast */
+
+    return sk_open(sk);
+}
+
+static void sk_tls_connected(sock *s) {
+    sockaddr sa;
+    int ret;
+    int sa_len = sizeof(sa);
+
+    if ((getsockname(s->fd, &sa.sa, &sa_len) < 0) ||
+        (sockaddr_read(&sa, s->af, &s->saddr, &s->iface, &s->sport) < 0))
+        log(L_WARN "SOCK: Cannot get local IP address for TLS>");
+
+    s->type = SK_TLS_HANDSHAKE_IN_PROGRESS;
+    sk_alloc_bufs(s);
+
+    /* init ptls handshake */
+    ret = ptls_handshake(s->tls->tls, &s->sendbuf, NULL, NULL, NULL);
+    assert(ret == PTLS_ERROR_IN_PROGRESS);
+    /* little trick to trigger write on io loop */
+    s->tpos += 1; /* will be reset when handshake is completed */
+    /* advance encrypted pos to trigger a socket write */
+    s->encrypted_send_pos += s->sendbuf.off;
+
+    /* dummy tls hooks to
+     * take them into account
+     * in poll syscall */
+    s->active_rx_hook = s->rx_hook;
+    s->active_tx_hook = s->tx_hook;
+    s->passive_sock = NULL; // force NULL ptr
+
+    s->rx_hook = tls_dummy_rx;
+    s->tx_hook = tls_dummy_tx;
+
+    //s->tx_hook(s);
+}
+
 #ifdef HAVE_LIBSSH
 static void
 sk_ssh_connected(sock *s)
@@ -1073,6 +1308,10 @@ sk_ssh_connected(sock *s)
 }
 #endif
 
+static void tls_handshake_err_hook(sock *sk, int err) {
+    rfree(sk);
+}
+
 static int
 sk_passive_connected(sock *s, int type)
 {
@@ -1080,7 +1319,7 @@ sk_passive_connected(sock *s, int type)
   int loc_sa_len = sizeof(loc_sa);
   int rem_sa_len = sizeof(rem_sa);
 
-  int fd = accept(s->fd, ((type == SK_TCP) ? &rem_sa.sa : NULL), &rem_sa_len);
+  int fd = accept(s->fd, (((type == SK_TCP || type == SK_TLS_HANDSHAKE_IN_PROGRESS)) ? &rem_sa.sa : NULL), &rem_sa_len);
   if (fd < 0)
   {
     if ((errno != EINTR) && (errno != EAGAIN))
@@ -1099,7 +1338,13 @@ sk_passive_connected(sock *s, int type)
   t->rbsize = s->rbsize;
   t->tbsize = s->tbsize;
 
-  if (type == SK_TCP)
+  if (s->type == SK_TLS_PASSIVE && s->tcp_auth_mode == AUTH_TCP_AO_TLS) {
+      t->tcp_auth_mode = s->tcp_auth_mode;
+      t->sndid = s->sndid;
+      t->rcvid = s->rcvid;
+  }
+
+  if (type == SK_TCP || type  == SK_TLS_HANDSHAKE_IN_PROGRESS)
   {
     if ((getsockname(fd, &loc_sa.sa, &loc_sa_len) < 0) ||
 	(sockaddr_read(&loc_sa, s->af, &t->saddr, &t->iface, &t->sport) < 0))
@@ -1123,7 +1368,40 @@ sk_passive_connected(sock *s, int type)
 
   sk_insert(t);
   sk_alloc_bufs(t);
-  s->rx_hook(t, 0);
+
+  /* Do not call app until TLS handshake is not finished yet */
+  if (type != SK_TLS_HANDSHAKE_IN_PROGRESS) {
+      s->rx_hook(t, 0);
+  } else {
+      /* add dummy rx & tx to include this
+       * socket in the poll syscall */
+
+      /* add err hook to remove tcp socket if
+       * something bad happens during TLS handshake */
+      t->err_hook = tls_handshake_err_hook;
+
+      t->tls = NULL; // still null
+      t->tls_ctx = s->tls_ctx;
+      t->passive_sock = s;
+
+      /* FIXME ugly hack copy verifier context from server to get correct ctx on callback  */
+      memcpy(t->tls_verif_obj, s->tls_verif_obj, sizeof(s->tls_verif_obj));
+      if (tls_update_cb_ref(&t->tls_ctx, t->tls_verif_obj, sizeof(t->tls_verif_obj)) == -1) {
+          printf("update error\n");
+      }
+
+      /* rx_hook will set corresponding data for the TLS state */
+      s->rx_hook(t, 0);
+      /* rx_hook should set the tls session
+       * but on unexpected connect, the socket must be discarded */
+      if (t->tls) {
+          /* then, we replace dummy rx & tx to  */
+          t->rx_hook = tls_dummy_rx;
+          t->tx_hook = tls_dummy_tx;
+          t->active_rx_hook = NULL; // force null because
+          t->active_tx_hook = NULL; // non active socket
+      }
+  }
   return 1;
 }
 
@@ -1342,7 +1620,7 @@ sk_open(sock *s)
   ip_addr bind_addr = IPA_NONE;
   sockaddr sa;
 
-  if (s->type <= SK_IP)
+  if (s->type <= SK_IP || IS_SK_TLS(s->type))
   {
     /*
      * For TCP/IP sockets, Address family (IPv4 or IPv6) can be specified either
@@ -1377,14 +1655,20 @@ sk_open(sock *s)
 
   switch (s->type)
   {
+  case SK_TLS_ACTIVE:
   case SK_TCP_ACTIVE:
     s->ttx = "";			/* Force s->ttx != s->tpos */
     /* Fall thru */
+  case SK_TLS_PASSIVE:
   case SK_TCP_PASSIVE:
     fd = socket(af, SOCK_STREAM, IPPROTO_TCP);
     bind_port = s->sport;
     bind_addr = s->saddr;
     do_bind = bind_port || ipa_nonzero(bind_addr);
+    break;
+  case SK_UNIX_ACTIVE:
+    af = AF_UNIX;
+    fd = socket(AF_UNIX, SOCK_STREAM, 0);
     break;
 
 #ifdef HAVE_LIBSSH
@@ -1458,26 +1742,58 @@ sk_open(sock *s)
       ERR2("bind");
   }
 
-  if (s->password)
-    if (sk_set_md5_auth(s, s->saddr, s->daddr, -1, s->iface, s->password, 0) < 0)
-      goto err;
+  if (s->password) {
+      switch (s->tcp_auth_mode) {
+          case AUTH_TCP_MD5:
+              if (sk_set_md5_auth(s, s->saddr, s->daddr, -1, s->iface, s->password, 0) < 0)
+                  goto err;
+              break;
+          case AUTH_TCP_AO:
+          case AUTH_TCP_AO_TLS:
+              if (sk_set_tcp_ao_auth(s, s->saddr, s->daddr, -1, s->iface, s->password,
+                                     s->password_len, s->sndid, s->rcvid, 1) < 0)
+                  goto err;
+              log(L_INFO "TCP-AO enabled (%d): %s (sndid %d, rcvid %d)", s->type,
+                  s->tcp_auth_mode == AUTH_TCP_AO ? "with provided password" : "draft-piraux-tcp-ao-tls mode",
+                  s->sndid, s->rcvid);
+              break;
+          default:
+              ERR2("TCP authentication mode not supported");
+              break;
+      }
+  }
 
   switch (s->type)
   {
+  case SK_TLS_ACTIVE:
   case SK_TCP_ACTIVE:
     sockaddr_fill(&sa, s->af, s->daddr, s->iface, s->dport);
     if (connect(fd, &sa.sa, SA_LEN(sa)) >= 0)
-      sk_tcp_connected(s);
+      if (s->type == SK_TCP_ACTIVE) sk_tcp_connected(s); else sk_tls_connected(s);
     else if (errno != EINTR && errno != EAGAIN && errno != EINPROGRESS &&
 	     errno != ECONNREFUSED && errno != EHOSTUNREACH && errno != ENETUNREACH)
       ERR2("connect");
     break;
 
+  case SK_TLS_PASSIVE:
   case SK_TCP_PASSIVE:
     if (listen(fd, 8) < 0)
       ERR2("listen");
     break;
-
+  case SK_UNIX_ACTIVE: {
+      /* little hack, put control_path to sk->host */
+      struct sockaddr_un un_addr;
+      memset(&un_addr, 0, sizeof(un_addr));
+      un_addr.sun_family = AF_UNIX;
+      strncpy(un_addr.sun_path, s->host, sizeof(un_addr.sun_path) - 1);
+      if (connect(fd, (const struct sockaddr *) &un_addr, sizeof(un_addr)) >= 0) {
+          sk_unix_connected(s);
+      } else if (errno != EINTR && errno != EAGAIN && errno != EINPROGRESS &&
+                 errno != ECONNREFUSED && errno != EHOSTUNREACH && errno != ENETUNREACH) {
+          ERR2("UNIX Connect");
+      }
+      break;
+  }
   case SK_SSH_ACTIVE:
   case SK_MAGIC:
     break;
@@ -1651,6 +1967,114 @@ sk_recvmsg(sock *s)
 
 static inline void reset_tx_buffer(sock *s) { s->ttx = s->tpos = s->tbuf; }
 
+
+static int
+sk_write_tls(sock *s) {
+    int ret;
+    int e;
+
+    size_t max_data_send;
+    size_t remaining_space;
+    size_t data_to_send;
+    size_t record_overhead;
+
+    /* take buffer from app then encrypt */
+    if (s->type == SK_TLS && s->tpos != s->ttx && !s->tls_drain) {
+
+        max_data_send = s->tpos - s->ttx;
+        remaining_space = s->encrypted_send_buf +
+                s->encrypted_send_buf_len -
+                s->encrypted_send_pos;
+        record_overhead = ptls_get_record_overhead(s->tls->tls);
+
+        if (remaining_space >= record_overhead) {
+            remaining_space -= record_overhead;
+
+            data_to_send = MIN(max_data_send, remaining_space);
+            ret = ptls_send(s->tls->tls, &s->sendbuf, s->ttx,  data_to_send);
+            if (ret != 0) {
+                log(L_ERR "ptls_send to %N error (%d)", s->daddr, ret);
+                s->err_hook(s, 0);
+                return -1;
+            }
+            assert(s->sendbuf.is_allocated == 0);
+            /* update encrypted_send_pos */
+            s->encrypted_send_pos = s->encrypted_send_buf + s->sendbuf.off;
+            /* we consumed user buffer, so update it */
+            s->ttx += data_to_send; //s->tpos - s->ttx;
+            assert(s->ttx <= s->tpos);
+            if (s->ttx == s->tpos) {
+                reset_tx_buffer(s);
+                s->tls_drain = 1;
+                /* trick for io_loop as encrypted buffer contains data */
+                s->tpos += 1;
+            }
+        }
+    }
+
+    while (s->encrypted_send_off != s->encrypted_send_pos) {
+        e = write(s->fd, s->encrypted_send_off, s->encrypted_send_pos - s->encrypted_send_off);
+        if (e < 0) {
+            if (errno != EINTR && errno != EAGAIN) {
+                /* reset_encrypt_tx_buffer; */
+                s->encrypted_send_off = s->encrypted_send_pos = s->encrypted_send_buf;
+                /* EPIPE is just a connection close notification during TX */
+                s->err_hook(s, (errno != EPIPE) ? errno : 0);
+                return -1;
+            }
+            return 0;
+        }
+        s->encrypted_send_off += e;
+        assert(s->sendbuf.off >= e );
+        s->sendbuf.off -= e;
+    }
+    /* reset ttx trick as no more data to send */
+    if (s->encrypted_send_off == s->encrypted_send_pos) {
+        if (s->type == SK_TLS_HANDSHAKE_IN_PROGRESS &&
+            s->tpos != s->tbuf /* this happens when the server is receiving
+                               * the first TLS data from the client */
+            ) {
+            s->tpos -= 1;
+            assert(s->tpos == s->tbuf);
+        }
+        /* reset encrypted send buffer */
+        s->encrypted_send_off = s->encrypted_send_buf;
+        s->encrypted_send_pos = s->encrypted_send_buf;
+        if (s->tls_drain) {
+            /* no more pending data */
+            s->tls_drain = 0;
+            s->tpos -= 1;
+            assert(s->tpos == s->tbuf);
+            return 1; /* io is now ready to accept more data to write */
+        }
+    }
+
+    if (s->type == SK_TLS_HANDSHAKE_IN_PROGRESS) {
+        if (ptls_handshake_is_complete(s->tls->tls)) {
+            //s->tpos -= 1;
+            assert(s->tpos == s->tbuf);
+            s->type = SK_TLS;
+            /* now trigger app */
+            if (s->rx_hook == tls_dummy_rx && s->passive_sock) {
+                /* this socket was passive */
+                s->tx_hook = s->passive_sock->tx_hook;
+                s->rx_hook = s->passive_sock->rx_hook;
+                s->passive_sock->rx_hook(s, 0);
+            } else if (s->tx_hook == tls_dummy_tx && s->active_tx_hook) {
+                /* this socket was active */
+                s->tx_hook = s->active_tx_hook;
+                s->rx_hook = s->active_rx_hook;
+                s->tx_hook(s);
+            } else {
+                assert(0 && "Illegal intern state");
+            }
+            return 0;
+        }
+    }
+    return 0;
+}
+
+
 static int
 sk_maybe_write(sock *s)
 {
@@ -1702,7 +2126,8 @@ sk_maybe_write(sock *s)
     reset_tx_buffer(s);
     return 1;
 #endif
-
+  case SK_TLS:
+      return sk_write_tls(s);
   case SK_UDP:
   case SK_IP:
     {
@@ -1813,9 +2238,117 @@ call_rx_hook(sock *s, int size)
   if (s->rx_hook(s, size))
   {
     /* We need to be careful since the socket could have been deleted by the hook */
-    if (current_sock == s)
+    if (current_sock == s) {
+      if (s->type == SK_TLS) {
+        assert(s->rpos - s->rbuf == size); /* todo remove this */
+        assert(s->recvbuf.off >= size); /* todo remove this also */
+        s->recvbuf.off -= size;
+        /* also, reset our off pointers */
+      }
       s->rpos = s->rbuf;
+    }
   }
+}
+
+static int
+sk_read_tls(sock *s, int revents) {
+    ssize_t c;
+    int ret;
+    byte *_rpos;
+    size_t consumed;
+    size_t input_off = 0;
+    size_t total_to_read;
+    int called_rx_hook = 0;
+
+    c = read(s->fd, s->recv_txt_pos, s->recv_plain_txt + s->recv_plain_txt_len - s->recv_txt_pos);
+
+    total_to_read = c + (s->recv_txt_pos - s->recv_plain_txt);
+
+    if (c < 0) {
+        if (errno != EINTR && errno != EAGAIN)
+            s->err_hook(s, errno);
+        else if (errno == EAGAIN && !(revents & POLLIN)) {
+            log(L_ERR "Got EAGAIN from read when revents=%x (without POLLIN)", revents);
+            s->err_hook(s, 0);
+        }
+    } else if (!c) {
+        if (s->err_hook) s->err_hook(s, 0);
+    } else {
+        /* decrypt tls records */
+        do {
+            consumed = total_to_read - input_off;
+            if (s->type == SK_TLS) {
+                ret = ptls_receive(s->tls->tls, &s->recvbuf, s->recv_plain_txt + input_off, &consumed);
+                if (ret != 0) {
+                    //abort(); // should generate a core dump
+                    die("ptls_receive error: %d", ret);
+                }
+                /* let's go, transmit the payload of one decrypted
+                 * TLS record to the app at a time to avoid
+                 * ptls_receive to malloc if s->rbuf is not large
+                 * enough to receive the totality of data read from
+                 * the socket s->fd. malloc is bad. */
+                assert(!s->recvbuf.is_allocated); /* We really do not want ptls_receive to malloc */
+                s->rpos = s->rbuf + s->recvbuf.off; // test
+                _rpos = s->rpos;
+                assert(s->rpos - s->rbuf == s->recvbuf.off);
+                if (!s->rx_hook) return 0; // may the case on BGP collision resolution
+                call_rx_hook(s, s->rpos - s->rbuf);
+                called_rx_hook = 1;
+
+                /* bgp might change the s->rpos pointer during packet processing............. */
+                if (s->rpos != _rpos) {
+                    assert(_rpos > s->rpos);
+                    s->recvbuf.off -= _rpos - s->rpos;
+                } // else {
+                  //  /* rpos did not change. reset rpos = rbuf ???? */
+                  // }
+            } else if (s->type == SK_TLS_HANDSHAKE_IN_PROGRESS) {
+                ret = ptls_handshake(s->tls->tls, &s->sendbuf, s->recv_plain_txt + input_off,
+                                     &consumed, NULL);
+
+                if (s->sendbuf.off == 0 && s->tpos != s->tbuf) {
+                    /* reset ttx trick */
+                    s->tpos -= 1;
+                    assert(s->tpos == s->tbuf);
+                } else if (s->tpos == s->tbuf) {
+                    s->tpos += 1; /* trigger write for TLS handshake */
+                    assert(s->tpos == s->tbuf + 1);
+                }
+                /* advance encrypted buffer offset */
+                s->encrypted_send_pos += s->sendbuf.off;
+
+                if (ret != 0 && ret != PTLS_ERROR_IN_PROGRESS) {
+                    fprintf(stderr, "PTLS HANDSHAKE ERROR %d\n", ret);
+                    if (s->err_hook) s->err_hook(s, 0);
+                    return 0;
+                }
+
+                if (consumed == 0 && s->sendbuf.off == 0) {
+                    /* since we do not send sendbuf directly,
+                     * there is a chance that the loop will never end */
+                    break;
+                }
+            }
+            input_off += consumed;
+        } while (ret == (s->type == SK_TLS_HANDSHAKE_IN_PROGRESS ? PTLS_ERROR_IN_PROGRESS : 0)
+                 && input_off < total_to_read);
+
+        /* shift non consumed data to the beginning of the buffer */
+        if (input_off != total_to_read) {
+            memmove(s->recv_plain_txt, s->recv_plain_txt + input_off, total_to_read - input_off);
+            s->recv_txt_pos = s->recv_plain_txt + (total_to_read - input_off);
+        } else {
+            /* everything is consumed, so reset offset pointer */
+            s->recv_txt_pos = s->recv_plain_txt;
+        }
+
+        if (s->type == SK_TLS) {
+            return called_rx_hook;
+        }
+    }
+
+    return 0;
 }
 
 #ifdef HAVE_LIBSSH
@@ -1874,10 +2407,13 @@ sk_read_noflush(sock *s, int revents)
   {
   case SK_TCP_PASSIVE:
     return sk_passive_connected(s, SK_TCP);
-
+  case SK_TLS_PASSIVE:
+    return sk_passive_connected(s, SK_TLS_HANDSHAKE_IN_PROGRESS);
   case SK_UNIX_PASSIVE:
     return sk_passive_connected(s, SK_UNIX);
-
+  case SK_TLS_HANDSHAKE_IN_PROGRESS:
+  case SK_TLS:
+      return sk_read_tls(s, revents);
   case SK_TCP:
   case SK_UNIX:
     {
@@ -1908,7 +2444,6 @@ sk_read_noflush(sock *s, int revents)
   case SK_SSH:
     return sk_read_ssh(s);
 #endif
-
   case SK_MAGIC:
     return s->rx_hook(s, 0);
 
@@ -1943,18 +2478,32 @@ sk_write_noflush(sock *s)
 {
   switch (s->type)
   {
+  case SK_TLS_ACTIVE:
   case SK_TCP_ACTIVE:
     {
       sockaddr sa;
       sockaddr_fill(&sa, s->af, s->daddr, s->iface, s->dport);
 
-      if (connect(s->fd, &sa.sa, SA_LEN(sa)) >= 0 || errno == EISCONN)
-	sk_tcp_connected(s);
-      else if (errno != EINTR && errno != EAGAIN && errno != EINPROGRESS)
-	s->err_hook(s, errno);
+      if (connect(s->fd, &sa.sa, SA_LEN(sa)) >= 0 || errno == EISCONN) {
+        if (s->type == SK_TCP_ACTIVE){
+            sk_tcp_connected(s);
+        } else {
+            sk_tls_connected(s);
+        }
+      } else if (errno != EINTR && errno != EAGAIN && errno != EINPROGRESS){
+          s->err_hook(s, errno);
+      }
       return 0;
     }
-
+  case SK_TLS:
+  case SK_TLS_HANDSHAKE_IN_PROGRESS:
+      if (sk_write_tls(s) > 0 && s->type == SK_TLS) {
+          if (s->tx_hook) {
+              s->tx_hook(s);
+          }
+          return 1;
+      }
+      return 0;
 #ifdef HAVE_LIBSSH
   case SK_SSH_ACTIVE:
     {

@@ -83,6 +83,8 @@ AC_ARG_WITH([iproutedir],
 AC_ARG_VAR([FLEX], [location of the Flex program])
 AC_ARG_VAR([BISON], [location of the Bison program])
 AC_ARG_VAR([M4], [location of the M4 program])
+AC_ARG_VAR([PICOTLS_HEADER], [location of the headers of picotls])
+AC_ARG_VAR([PICOTLS_LIB], [location of the picotls libraries])
 
 if test "$enable_debug_expensive" = yes; then
   enable_debug=yes
@@ -192,6 +194,8 @@ AC_CHECK_PROGS([M4], [gm4 m4])
 test -z "$FLEX"	 && AC_MSG_ERROR([Flex is missing.])
 test -z "$BISON" && AC_MSG_ERROR([Bison is missing.])
 test -z "$M4"	 && AC_MSG_ERROR([M4 is missing.])
+test -z "$PICOTLS_HEADER" && AC_MSG_ERROR([Picotls headers location is missing.])
+test -z "$PICOTLS_LIB"    && AC_MSG_ERROR([Picotls libraries location is missing.])
 
 AC_MSG_CHECKING([bison version])
 BIRD_CHECK_BISON_VERSION(BISON_VERSION)
@@ -211,6 +215,25 @@ BIRD_CHECK_PROG_FLAVOR_GNU([$M4],
   [],
   [AC_MSG_ERROR([Provided M4 is not GNU M4.])]
 )
+
+CFLAGS="$CFLAGS -I$PICOTLS_HEADER"
+AC_CHECK_HEADER(["picotls.h"], [], [AC_MSG_ERROR([picotls header not found])])
+LDFLAGS="$LDFLAGS -L$PICOTLS_LIB"
+AC_CHECK_LIB([picotls-core], [ptls_send],
+             [], [AC_MSG_ERROR([libpicotls-core not found])],
+             [])
+AC_CHECK_LIB([picotls-fusion], [ptls_fusion_aes128ctr],
+             [], [AC_MSG_ERROR([libpicotls-fusion not found])],
+             [])
+AC_CHECK_LIB([crypto], [BIO_get_init],
+             [], [AC_MSG_ERROR([libcrypto not found])],
+             [])
+AC_CHECK_LIB([ssl], [OPENSSL_init_ssl],
+             [], [AC_MSG_ERROR([libssl not found])],
+             [])
+AC_CHECK_LIB([picotls-openssl], [ptls_openssl_init_verify_certificate],
+             [], [AC_MSG_ERROR([libpicotls-openssl not found])],
+             [])
 
 if test -n "$with_sysconfig" -a "$with_sysconfig" != no ; then
   if test -f $with_sysconfig ; then
