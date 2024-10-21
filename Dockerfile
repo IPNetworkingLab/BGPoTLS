@@ -1,10 +1,10 @@
-FROM alpine:3.20 as BIRDTLS
+FROM alpine:3.20 AS birdtls
 RUN apk update && \
     apk upgrade --available && \
     apk add openssh libssh
 
 
-FROM BIRDTLS as BUILDER
+FROM birdtls AS builder
 RUN apk update && \
     apk upgrade --available && \
     apk add bison flex ncurses-dev \
@@ -38,8 +38,8 @@ RUN cd /opt/bgpotls && \
         --docdir=/usr/share/man && \
     make
 
-FROM BIRDTLS
-COPY --from=BUILDER /opt/bgpotls/bird /opt/bgpotls/birdc /opt/bgpotls/birdcl  /usr/sbin/
+FROM birdtls
+COPY --from=builder /opt/bgpotls/bird /opt/bgpotls/birdc /opt/bgpotls/birdcl  /usr/sbin/
 # create required files
 RUN mkdir /etc/bird
 # install tini init daemon
