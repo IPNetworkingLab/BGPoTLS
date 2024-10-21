@@ -5,7 +5,14 @@
 #include "sysdep/unix/unix.h"
 
 #include <string.h>
+
+#include <linux/version.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,7,0)
 #include <linux/tcp.h>
+#else
+#warning "Compiling TCP-AO USING external <linux/tcp.h>"
+#include "linux_tcp.h"
+#endif
 
 static u8 tls_ao_initial__[] = (u8[]) {0x1c, 0xeb, 0xb1, 0xff};
 
@@ -193,3 +200,4 @@ sk_set_tcp_ao_auth(sock *s, ip_addr local UNUSED, ip_addr remote, int pxlen, str
 
     return sk_del_tcp_ao_key(s, remote, pxlen, ifa, sndid, rcvid);
 }
+
